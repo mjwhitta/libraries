@@ -26,6 +26,8 @@ const (
 	// Errors
 	UnexpectedTestError      int = 1
 	MalformedTestError       int = 2
+	InvalidTestSigError      int = 3
+	InvalidCleanSigError     int = 4
 	TimeoutExceeded          int = 102
 	CleanupFailed            int = 103
 	OutOfMemory              int = 137
@@ -57,17 +59,28 @@ type DropperPayload struct {
 	Contents []byte
 }
 
+// State maintains test state for each step of a test. This includes
+// the current step and any relevant "variables".
+type State struct {
+	Step int
+	Vars map[string]any
+}
+
 var (
-	bin, binErr        = os.Executable()
-	cleanup     func() = func() {}
-	cwd, cwdErr        = os.Getwd()
-	results            = map[int]string{
+	bin, binErr              = os.Executable()
+	cleanup     any          = newFunc
+	cwd, cwdErr              = os.Getwd()
+	legacyFunc  func()       = func() {}
+	newFunc     func(*State) = func(state *State) {}
+	results                  = map[int]string{
 		CleanupFailed:               "cleanup failed",
 		ExecutionPrevented:          "execution prevented",
 		FileQuarantinedOnExecution:  "file quarantined on execution",
 		FileQuarantinedOnExtraction: "file quarantined on extraction",
 		HostNotVulnerabile:          "host not vulnerable",
 		InsufficientPrivileges:      "insufficient privileges",
+		InvalidCleanSigError:        "invalid clean function signature",
+		InvalidTestSigError:         "invalid test function signature",
 		MalformedTestError:          "malformed test error",
 		NetworkConnectionBlocked:    "network connection blocked",
 		NotRelevant:                 "not relevant",
@@ -83,6 +96,7 @@ var (
 		Unprotected:                 "unprotected",
 	}
 	socketPath string
+	state      *State      = &State{}
 	stopMutex  *sync.Mutex = &sync.Mutex{}
 )
 
@@ -475,30 +489,61 @@ func Shell(args []string) (string, error) {
 // run when Stop() is called. The default cleanup does nothing. A
 // custom clean function can be optionally provided. The timeout can
 // be overridden by configuring Cfg in advance.
-func Start(test func(), clean ...func()) {
+func Start(test any, clean ...any) {
 	var cfg Config = defaultCfg(Config{timeout: 30 * time.Second})
-	var done chan struct{} = make(chan struct{}, 1)
-
-	defer close(done)
+	var stopped chan struct{} = make(chan struct{}, 1)
+	defer close(stopped)
 
 	if len(clean) > 0 {
 		cleanup = clean[0]
+
+		switch cleanup := cleanup.(type) {
+		case func(*State): // New clean function signature
+		case func(): // Support legacy clean functions
+		default: // Invalid test function signature
+			Say("Unexpected clean signature: %T", cleanup)
+			Say("Expected %T or %T.", newFunc, legacyFunc)
+			Stop(InvalidCleanSigError)
+		}
 	}
 
 	Say("Starting test")
 
 	go func() {
-		test()
-		done <- struct{}{}
+		for {
+			select {
+			case <-stopped:
+				return
+			default:
+				state.Step++
+				if state.Vars == nil {
+					state.Vars = map[string]any{}
+				}
+
+				if state.Step > 1000 {
+					Say("Test execution exceeded max number of steps")
+					Stop(UnexpectedTestError)
+				}
+
+				switch test := test.(type) {
+				case func(*State): // New test function signature
+					test(state)
+				case func(): // Support legacy test functions
+					test()
+					return
+				default: // Invalid test function signature
+					Say("Unexpected test signature: %T", test)
+					Say("Expected %T or %T.", newFunc, legacyFunc)
+					Stop(InvalidTestSigError)
+				}
+			}
+		}
 	}()
 
-	select {
-	case <-done:
-		Stop(TestCompletedNormally)
-	case <-time.After(cfg.timeout):
-		Say("Test execution exceeded time limit: %s", cfg.timeout)
-		Stop(TimeoutExceeded)
-	}
+	time.Sleep(cfg.timeout)
+	stopped <- struct{}{}
+	Say("Test execution exceeded time limit: %s", cfg.timeout)
+	Stop(TimeoutExceeded)
 }
 
 func startDropperChildProcess() (*os.Process, error) {
@@ -541,15 +586,15 @@ func Stop(code int) {
 	stopMutex.Lock()
 	defer stopMutex.Unlock()
 
-	cleanup()
-
-	// Get the caller's line number (might have to go up levels if
-	// Stop() is used by the module itself)
-	caller := 1
-	_, fn, line, _ := runtime.Caller(caller)
-	for filepath.Base(fn) == "endpoint.go" {
-		caller++
-		_, fn, line, _ = runtime.Caller(caller)
+	switch code {
+	case InvalidCleanSigError, InvalidTestSigError:
+	default:
+		switch cleanup := cleanup.(type) {
+		case func(*State): // New clean function signature
+			cleanup(state)
+		case func(): // Support legacy clean functions
+			cleanup()
+		}
 	}
 
 	// Get user-friendly message for the provided code
@@ -559,7 +604,7 @@ func Stop(code int) {
 	}
 
 	Say("Completed with code: %d (%s)", code, result)
-	Say("Exit called from %s:%d", filepath.Base(fn), line)
+	Say("Exit called during step %d", state.Step)
 	Say("Ending test")
 
 	os.Exit(code)
