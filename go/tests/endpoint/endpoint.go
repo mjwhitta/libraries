@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +23,8 @@ const (
 	// Errors
 	UnexpectedTestError      int = 1
 	MalformedTestError       int = 2
+	InvalidTestSigError      int = 3
+	InvalidCleanSigError     int = 4
 	TimeoutExceeded          int = 102
 	CleanupFailed            int = 103
 	OutOfMemory              int = 137
@@ -48,7 +49,18 @@ const (
 	TestIncorrectlyBlocked int = 110
 )
 
-var cleanup func() = func() {}
+// State maintains test state for each step of a test. This includes
+// the current step and any relevant "variables".
+type State struct {
+	Step int
+	Vars map[string]any
+}
+
+var (
+	cleanup    any          = newFunc
+	legacyFunc func()       = func() {}
+	newFunc    func(*State) = func(state *State) {}
+)
 
 var results = map[int]string{
 	CleanupFailed:               "cleanup failed",
@@ -56,6 +68,8 @@ var results = map[int]string{
 	FileQuarantinedOnExecution:  "file quarantined on execution",
 	FileQuarantinedOnExtraction: "file quarantined on extraction",
 	HostNotVulnerabile:          "host not vulnerable",
+	InvalidCleanSigError:        "invalid clean function signature",
+	InvalidTestSigError:         "invalid test function signature",
 	MalformedTestError:          "malformed test error",
 	NetworkConnectionBlocked:    "network connection blocked",
 	NotRelevant:                 "not relevant",
@@ -71,27 +85,69 @@ var results = map[int]string{
 	Unprotected:                 "unprotected",
 }
 
-var stopMutex *sync.Mutex = &sync.Mutex{}
+var (
+	state     *State      = &State{}
+	stopMutex *sync.Mutex = &sync.Mutex{}
+)
 
 // Start takes a test function and runs it in the background. By
 // default it waits 30 seconds before timeout. The cleanup function is
 // run when Stop() is called. The default cleanup does nothing. A
 // custom clean function can be optionally provided. The timeout can
 // be overridden by configuring Cfg in advance.
-func Start(test func(), clean ...func()) {
+func Start(test any, clean ...any) {
 	var cfg Config = defaultCfg(Config{timeout: 30 * time.Second})
+	var stopped chan struct{} = make(chan struct{}, 1)
+	defer close(stopped)
 
 	if len(clean) > 0 {
 		cleanup = clean[0]
+
+		switch cleanup := cleanup.(type) {
+		case func(*State): // New clean function signature
+		case func(): // Support legacy clean functions
+		default: // Invalid test function signature
+			Sayf("Unexpected clean signature: %T", cleanup)
+			Sayf("Expected %T or %T.", newFunc, legacyFunc)
+			Stop(InvalidCleanSigError)
+		}
 	}
 
 	Say("Starting test")
 
 	go func() {
-		test()
+		for {
+			select {
+			case <-stopped:
+				return
+			default:
+				state.Step++
+				if state.Vars == nil {
+					state.Vars = map[string]any{}
+				}
+
+				if state.Step > 1000 {
+					Say("Test execution exceeded max number of steps")
+					Stop(UnexpectedTestError)
+				}
+
+				switch test := test.(type) {
+				case func(*State): // New test function signature
+					test(state)
+				case func(): // Support legacy test functions
+					test()
+					return
+				default: // Invalid test function signature
+					Sayf("Unexpected test signature: %T", test)
+					Sayf("Expected %T or %T.", newFunc, legacyFunc)
+					Stop(InvalidTestSigError)
+				}
+			}
+		}
 	}()
 
 	time.Sleep(cfg.timeout)
+	stopped <- struct{}{}
 	Sayf("Test execution exceeded time limit: %s", cfg.timeout)
 	Stop(TimeoutExceeded)
 }
@@ -103,15 +159,15 @@ func Stop(code int) {
 	stopMutex.Lock()
 	defer stopMutex.Unlock()
 
-	cleanup()
-
-	// Get the caller's line number (might have to go up levels if
-	// Stop() is used by the module itself)
-	caller := 1
-	_, fn, line, _ := runtime.Caller(caller)
-	for filepath.Base(fn) == "endpoint.go" {
-		caller++
-		_, fn, line, _ = runtime.Caller(caller)
+	switch code {
+	case InvalidCleanSigError, InvalidTestSigError:
+	default:
+		switch cleanup := cleanup.(type) {
+		case func(*State): // New clean function signature
+			cleanup(state)
+		case func(): // Support legacy clean functions
+			cleanup()
+		}
 	}
 
 	// Get user-friendly message for the provided code
@@ -121,7 +177,7 @@ func Stop(code int) {
 	}
 
 	Sayf("Completed with code: %d (%s)", code, result)
-	Sayf("Exit called from line: %d", line)
+	Sayf("Exit called during step %d", state.Step)
 	Say("Ending test")
 
 	os.Exit(code)
