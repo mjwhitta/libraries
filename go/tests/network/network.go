@@ -12,10 +12,12 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/mjwhitta/inet"
 )
 
 type Requester struct {
-	Client    *http.Client
+	Client    inet.Client
 	URL       string
 	UserAgent string
 }
@@ -46,7 +48,6 @@ type ResponseData struct {
 }
 
 func NewHTTPRequest(requestURL string, opts *RequestOptions) *Requester {
-
 	timeout := time.Second * 1
 	userAgent := "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:91.0) Gecko/20100101 Firefox/91.0"
 
@@ -60,12 +61,13 @@ func NewHTTPRequest(requestURL string, opts *RequestOptions) *Requester {
 	}
 
 	return &Requester{
-		Client: &http.Client{
-			Timeout: timeout,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		Client: inet.DefaultClient.SetTimeout(timeout).SetTransport(
+			&http.Transport{
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: true,
+				},
 			},
-		},
+		),
 		URL:       requestURL,
 		UserAgent: userAgent,
 	}
