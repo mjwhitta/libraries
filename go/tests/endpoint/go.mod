@@ -1,3 +1,3 @@
-module github.com/preludeorg/libraries/go/tests/endpoint
+module github.com/mjwhitta/libraries/go/tests/endpoint
 
 go 1.21

@@ -1,4 +1,4 @@
-module github.com/preludeorg/libraries/go/tests/network
+module github.com/mjwhitta/libraries/go/tests/network
 
 go 1.24.0
 
